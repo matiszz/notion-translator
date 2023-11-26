@@ -1,0 +1,4 @@
+notion-client==2.1.0
+deep-translator==1.11.4
+python-dotenv==1.0.0
+commander==0.2.3
