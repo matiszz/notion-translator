@@ -89,13 +89,13 @@ function fixPunctuation(original, translated) {
     return translated;
 }
 
-async function translateText(richTextArray, from, to) {
+async function translateTextWithChatGPT(richTextArray, from, to) {
     const wholeText = richTextArray.map((each) => each.plain_text).join("");
 
     let messages = [
         {
             role: 'system',
-            content: `You are a translator that translates blocks of text from ${from} to ${to}. The user will send the text in chunks. YOU WILL ONLY TRANSLATE WHAT THE USER IS SENDING, NOT MORE. For context, here's the complete text. Make sure every fragment makes sense.\n\n-----\n${wholeText}\n-----\n`,
+            content: `You are a translator that translates blocks of text from ${from} to ${to}.`,
         }
     ];
 
@@ -107,8 +107,7 @@ async function translateText(richTextArray, from, to) {
                     content: getPrompt(from, to, each.plain_text)
                 }
             );
-
-            const result = await translateTextWithOpenAI(messages);
+            const result = await translator.translateText(each.plain_text, from, to);
             const fixedResult = fixPunctuation(each.plain_text, result);
 
             messages.push(
@@ -119,7 +118,19 @@ async function translateText(richTextArray, from, to) {
             );
 
             console.log(messages)
-            each.plain_text = fixedResult;
+            each.plain_text = fixPunctuation(each.plain_text, result.text);
+            if (each.text) {
+                each.text.content = each.plain_text;
+            }
+        }
+    }
+}
+
+async function translateText(richTextArray, from, to) {
+    for (const each of richTextArray) {
+        if (each.plain_text) {
+            const result = await translator.translateText(each.plain_text, from, to);
+            each.plain_text = fixPunctuation(each.plain_text, result.text);
             if (each.text) {
                 each.text.content = each.plain_text;
             }
@@ -229,14 +240,15 @@ program
     .requiredOption("-u, --url <https://www.notion.so/...>")
     .requiredOption(`-f, --from <${printableSupportedFromLangs}>`)
     .requiredOption(`-t, --to <${printableSupportedToLangs}>`)
-    .option("-d, --debug");
+    .option("-d, --debug")
+    .option("-r, --recursive")
 
 program.showHelpAfterError();
 
 program.parse();
 
 const options = program.opts();
-const {url, from, to, debug} = options;
+const {url, from, to, debug, recursive} = options;
 
 if (!supportedFromLangs.includes(from.toUpperCase())) {
     console.error(
@@ -272,26 +284,29 @@ async function buildTranslatedBlocks(id, nestedDepth) {
     const translatedBlocks = [];
     let cursor;
     let hasMore = true;
+
     while (hasMore) {
         const blocks = await notion.blocks.children.list({
             block_id: id,
             start_cursor: cursor,
             page_size: 100, // max 100
         });
+
         if (debug) {
             console.log(
                 `Fetched original blocks: ${JSON.stringify(blocks.results, null, 2)}`
             );
         }
+
         // Print dot for the user that is waiting for the completion
         process.stdout.write(".");
 
         for (const result of blocks.results) {
-            var b = result;
+            let b = result;
             if (nestedDepth >= 2) {
                 b.has_children = false;
             }
-            if (nestedDepth == 1) {
+            if (nestedDepth === 1) {
                 if (b.type === "column_list") {
                     // If this column_list block is already in the one-level nested children,
                     // its children (= column blocks) are unable to have children
@@ -378,26 +393,27 @@ async function buildTranslatedBlocks(id, nestedDepth) {
                     };
                 }
             }
-            if (b.type === "child_page") {
-                // Convert a child_page in the original page to link_to_page
-                try {
-                    b.type = "link_to_page";
-                    const page = await notion.pages.retrieve({page_id: b.id});
-                    b.link_to_page = {
-                        type: "page_id",
-                        page_id: page.id,
-                    };
-                    delete b.child_page;
-                    b.has_children = false;
-                } catch (e) {
-                    if (debug) {
-                        console.log(
-                            `Failed to load a page (error: ${e}) - Skipped this block.`
-                        );
-                    }
-                    continue;
-                }
-            } else if (b.type === "child_database") {
+            // if (b.type === "child_page") {
+            //     // Convert a child_page in the original page to link_to_page
+            //     try {
+            //         b.type = "link_to_page";
+            //         const page = await notion.pages.retrieve({page_id: b.id});
+            //         b.link_to_page = {
+            //             type: "page_id",
+            //             page_id: page.id,
+            //         };
+            //         delete b.child_page;
+            //         b.has_children = false;
+            //     } catch (e) {
+            //         if (debug) {
+            //             console.log(
+            //                 `Failed to load a page (error: ${e}) - Skipped this block.`
+            //             );
+            //         }
+            //         continue;
+            //     }
+            // }
+            else if (b.type === "child_database") {
                 // Convert a child_database in the original page to link_to_page
                 try {
                     b.type = "link_to_page";
@@ -450,6 +466,37 @@ async function buildTranslatedBlocks(id, nestedDepth) {
     return translatedBlocks;
 }
 
+async function getChildrenPagesIds(pageId) {
+    let childrenPagesIds = [];
+
+    let cursor;
+    let hasMore = true;
+    while (hasMore) {
+        const blocks = await notion.blocks.children.list({
+            block_id: pageId,
+            start_cursor: cursor,
+            page_size: 100, // max 100
+        });
+
+        // Filter pages with type "child_page"
+        const partialChildrenPagesIds = blocks.results.filter((block) => block.type === "child_page").map((block) => block.id);
+        childrenPagesIds = childrenPagesIds.concat(partialChildrenPagesIds);
+
+        // For pagination
+        if (blocks.has_more) {
+            cursor = blocks.next_cursor;
+        } else {
+            hasMore = false;
+        }
+    }
+
+    if (debug) {
+        console.log(`Children pages ids: ${toPrettifiedJSON(childrenPagesIds)}`);
+    }
+
+    return childrenPagesIds;
+}
+
 async function createNewPageForTranslation(originalPage) {
     const newPage = JSON.parse(JSON.stringify(originalPage)); // Create a deep copy
     // Create the translated page as a child of the original page
@@ -477,62 +524,80 @@ async function createNewPageForTranslation(originalPage) {
 (async function () {
     let originalPage;
     const contentId = url.split("/").last().split("-").last();
-    try {
-        originalPage = await notion.pages.retrieve({page_id: contentId});
-    } catch (e) {
+
+    let pagesToTranslate = [contentId];
+
+    console.log(pagesToTranslate)
+
+    if (recursive) {
+        console.log('Recursive')
+        const nestedPagesIds = await getChildrenPagesIds(contentId)
+        pagesToTranslate = [...nestedPagesIds, ...pagesToTranslate];
+        console.log(pagesToTranslate)
+    }
+
+    while (pagesToTranslate.length > 0) {
+        const pageId = pagesToTranslate.pop();
+        console.log('First ID', pageId)
+
         try {
-            await notion.databases.retrieve({database_id: contentId});
-            console.error(
-                "\nERROR: This URL is a database. This tool currently supports only pages.\n"
-            );
-        } catch (_) {
-            console.error(
-                `\nERROR: Failed to read the page content!\n\nError details: ${e}\n\nPlease make sure the following:\n * The page is shared with your app\n * The API token is the one for this workspace\n`
-            );
+            originalPage = await notion.pages.retrieve({page_id: pageId});
+        } catch (e) {
+            try {
+                await notion.databases.retrieve({database_id: pageId});
+                console.error(
+                    "\nERROR: This URL is a database. This tool currently supports only pages.\n"
+                );
+            } catch (_) {
+                console.error(
+                    `\nERROR: Failed to read the page content!\n\nError details: ${e}\n\nPlease make sure the following:\n * The page is shared with your app\n * The API token is the one for this workspace\n`
+                );
+            }
+            process.exit(1);
         }
-        process.exit(1);
-    }
-    if (debug) {
-        console.log(`The page metadata: ${toPrettifiedJSON(originalPage)}`);
-    }
+        if (debug) {
+            console.log(`The page metadata: ${toPrettifiedJSON(originalPage)}`);
+        }
 
-    process.stdout.write(
-        `\nWait a minute! Now translating the following Notion page:\n${url}\n\n(this may take some time) ...`
-    );
-    const translatedBlocks = await buildTranslatedBlocks(originalPage.id, 0);
-    const newPage = await createNewPageForTranslation(originalPage);
-    const blocksAppendParams = {
-        block_id: newPage.id,
-        children: translatedBlocks,
-    };
-    if (debug) {
-        console.log(
-            `Block creation request params: ${toPrettifiedJSON(blocksAppendParams)}`
+        process.stdout.write(
+            `\nWait a minute! Now translating the following Notion page:\n${url}\n\n(this may take some time) ...`
         );
-    }
 
-    const pageSize = 10;
-    let beginIndex = 0;
-    let endIndex = 0;
-    do {
-        beginIndex = endIndex;
-        endIndex = (beginIndex + pageSize) < translatedBlocks.length ? beginIndex + pageSize : translatedBlocks.length;
-        const reducedBlocks = translatedBlocks.slice(beginIndex, endIndex);
-
+        const translatedBlocks = await buildTranslatedBlocks(originalPage.id, 0);
+        const newPage = await createNewPageForTranslation(originalPage);
         const blocksAppendParams = {
             block_id: newPage.id,
-            children: reducedBlocks,
+            children: translatedBlocks,
         };
 
-        const blocksAddition = await notion.blocks.children.append(blocksAppendParams);
         if (debug) {
-            console.log(`Block creation response: ${toPrettifiedJSON(blocksAddition)}`);
+            console.log(
+                `Block creation request params: ${toPrettifiedJSON(blocksAppendParams)}`
+            );
         }
-    } while (endIndex < translatedBlocks.length);
 
-    console.log(
-        "... Done!\n\nDisclaimer:\nSome parts might not be perfect.\nIf the generated page is missing something, please adjust the details on your own.\n"
-    );
-    console.log(`Here is the translated Notion page:\n${newPage.url}\n`);
-    open(newPage.url);
+        const pageSize = 10;
+        let beginIndex = 0;
+        let endIndex = 0;
+        do {
+            beginIndex = endIndex;
+            endIndex = (beginIndex + pageSize) < translatedBlocks.length ? beginIndex + pageSize : translatedBlocks.length;
+            const reducedBlocks = translatedBlocks.slice(beginIndex, endIndex);
+
+            const blocksAppendParams = {
+                block_id: newPage.id,
+                children: reducedBlocks,
+            };
+
+            const blocksAddition = await notion.blocks.children.append(blocksAppendParams);
+            if (debug) {
+                console.log(`Block creation response: ${toPrettifiedJSON(blocksAddition)}`);
+            }
+        } while (endIndex < translatedBlocks.length);
+
+        console.log(
+            "... Done!\n\nDisclaimer:\nSome parts might not be perfect.\nIf the generated page is missing something, please adjust the details on your own.\n"
+        );
+        console.log(`Here is the translated Notion page:\n${newPage.url}\n`);
+    }
 })();
